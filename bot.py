@@ -40,8 +40,9 @@ class OciOccFix:
         self.clients = self.initialize_oci_clients()
         
         # Phase 4: Telegram integration
-        self.tg_bot = self.initialize_telegram()
+        # Fixed execution order
         self.tg_message_id = None
+        self.tg_bot = self.initialize_telegram()
         
         # Phase 5: Runtime state
         self.total_retries = 0
@@ -136,10 +137,10 @@ class OciOccFix:
         """Send startup message with enhanced error handling"""
         try:
             tenancy = self.clients['identity'].get_tenancy(
-                compartment_id=self.config.get('OCI', 'compartment_id')
+                self.config.get('OCI', 'compartment_id')
             ).data
             users = self.clients['identity'].list_users(
-                compartment_id=self.config.get('OCI', 'compartment_id')
+                self.config.get('OCI', 'compartment_id')
             ).data
             
             message = (
