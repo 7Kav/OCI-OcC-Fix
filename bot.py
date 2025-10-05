@@ -13,6 +13,7 @@ import telebot
 import datetime
 import configparser
 import json
+import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Optional, List
@@ -22,6 +23,110 @@ CONFIG_FILE = 'configuration.ini'
 LOG_FILE = 'oci_occ.log'
 MAX_LOG_SIZE = 5 * 1024 * 1024  # 5 MB
 LOG_BACKUP_COUNT = 3
+
+class CurlConfigParser:
+    """Parse curl commands to extract OCI configuration parameters"""
+
+    @staticmethod
+    def parse_curl_command(curl_text: str) -> Dict[str, str]:
+        """Extract configuration parameters from curl command"""
+        # Extract data payload
+        data_match = re.search(r'--data-raw\s+(.+)', curl_text, re.DOTALL)
+        if not data_match:
+            return {}
+
+        # Clean Windows escaping and parse JSON
+        data_str = data_match.group(1).strip()
+        # Remove outer quotes first
+        if data_str.startswith('^"') and data_str.endswith('"'):
+            data_str = data_str[2:-1]
+        elif data_str.startswith('"') and data_str.endswith('"'):
+            data_str = data_str[1:-1]
+
+        # Clean Windows command escaping
+        for char in ['^"', '^{', '^}', '^,', '^:', '^[', '^]']:
+            data_str = data_str.replace(char, char[1:])
+        data_str = data_str.replace('^', '').replace('\\"', '"').replace("\\'", "'")
+        data_str = ' '.join(data_str.split())
+
+        try:
+            data_json = json.loads(data_str)
+            config_data = {}
+
+            # Map JSON fields to config
+            if 'availabilityDomain' in data_json:
+                config_data['availability_domains'] = json.dumps([data_json['availabilityDomain']])
+            if 'compartmentId' in data_json:
+                config_data['compartment_id'] = data_json['compartmentId']
+            if 'displayName' in data_json:
+                config_data['display_name'] = data_json['displayName']
+            if 'shape' in data_json:
+                config_data['shape'] = data_json['shape']
+                config_data['type'] = 'ARM' if 'A1.Flex' in data_json['shape'] else 'AMD'
+
+            # Handle nested objects
+            if 'createVnicDetails' in data_json and 'subnetId' in data_json['createVnicDetails']:
+                config_data['subnet_id'] = data_json['createVnicDetails']['subnetId']
+
+            if 'sourceDetails' in data_json:
+                source = data_json['sourceDetails']
+                if 'imageId' in source:
+                    config_data['image_id'] = source['imageId']
+                if 'bootVolumeSizeInGBs' in source:
+                    config_data['boot_volume_size'] = str(source['bootVolumeSizeInGBs'])
+
+            if 'shapeConfig' in data_json:
+                shape = data_json['shapeConfig']
+                if 'ocpus' in shape:
+                    config_data['ocpus'] = str(shape['ocpus'])
+                if 'memoryInGBs' in shape:
+                    config_data['memory'] = str(shape['memoryInGBs'])
+
+            if 'metadata' in data_json and 'ssh_authorized_keys' in data_json['metadata']:
+                config_data['ssh_keys'] = data_json['metadata']['ssh_authorized_keys']
+
+            return config_data
+        except json.JSONDecodeError:
+            return {}
+
+    @staticmethod
+    def generate_config_file(config_data: Dict[str, str], output_file: str = CONFIG_FILE):
+        """Generate configuration.ini file from parsed data"""
+        config = configparser.ConfigParser()
+        if Path(output_file).exists():
+            config.read(output_file)
+
+        # Create sections and defaults
+        defaults = {
+            'DEFAULT': {'version': '2.1.4'},
+            'OCI': {'boot_volume_id': 'xxxx'},
+            'Instance': {},
+            'Telegram': {'bot_token': 'xxxx', 'uid': 'xxxx'},
+            'Machine': {},
+            'Retry': {'min_interval': '1', 'max_interval': '60', 'initial_retry_interval': '1', 'backoff_factor': '1.5'},
+            'Logging': {'log_level': 'INFO'}
+        }
+
+        for section, values in defaults.items():
+            if section != 'DEFAULT' and not config.has_section(section):
+                config.add_section(section)
+            for key, value in values.items():
+                config.set(section, key, value)
+
+        # Apply parsed data
+        section_mapping = {
+            'availability_domains': 'OCI', 'compartment_id': 'OCI', 'subnet_id': 'OCI', 'image_id': 'OCI',
+            'display_name': 'Instance', 'ssh_keys': 'Instance', 'boot_volume_size': 'Instance',
+            'type': 'Machine', 'shape': 'Machine', 'ocpus': 'Machine', 'memory': 'Machine'
+        }
+
+        for key, value in config_data.items():
+            if key in section_mapping:
+                config.set(section_mapping[key], key, value)
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            config.write(f)
+        return config
 
 class OciOccFix:
     def __init__(self):
@@ -50,31 +155,81 @@ class OciOccFix:
 
     @staticmethod
     def load_config() -> configparser.ConfigParser:
-        """Load and validate configuration with strict checks"""
+        """Load and validate configuration with auto-setup if missing"""
         config = configparser.ConfigParser()
-        if not Path(CONFIG_FILE).exists():
-            raise FileNotFoundError(f"Configuration file {CONFIG_FILE} not found")
-        
-        config.read(CONFIG_FILE)
-        
-        # Validate required sections
-        required_sections = ['OCI', 'Instance', 'Telegram', 'Machine', 'Retry']
-        for section in required_sections:
-            if not config.has_section(section):
-                raise ValueError(f"Missing required section: [{section}]")
 
-        # Validate Retry parameters
-        required_retry_keys = [
-            'min_interval',
-            'max_interval',
-            'initial_retry_interval',
-            'backoff_factor'
-        ]
-        for key in required_retry_keys:
-            if not config.has_option('Retry', key):
-                raise ValueError(f"Missing required Retry key: {key}")
-                
+        # Check if config needs setup
+        if not OciOccFix.is_config_complete():
+            config = OciOccFix.setup_config()
+        else:
+            config.read(CONFIG_FILE)
+
+        OciOccFix.validate_config_sections(config)
         return config
+
+    @staticmethod
+    def is_config_complete() -> bool:
+        """Check if configuration file exists and has all required parameters"""
+        if not Path(CONFIG_FILE).exists():
+            return False
+
+        config = configparser.ConfigParser()
+        config.read(CONFIG_FILE)
+
+        required_params = {
+            'OCI': ['image_id', 'availability_domains', 'compartment_id', 'subnet_id'],
+            'Instance': ['display_name', 'ssh_keys', 'boot_volume_size'],
+            'Machine': ['type', 'shape', 'ocpus', 'memory']
+        }
+
+        return all(
+            config.has_section(section) and
+            all(config.has_option(section, key) and config.get(section, key).strip()
+                for key in keys)
+            for section, keys in required_params.items()
+        )
+
+    @staticmethod
+    def setup_config() -> configparser.ConfigParser:
+        """Setup configuration from user input"""
+        print("Configuration missing. Please paste your curl command:")
+        print("(Press Enter twice when done)")
+
+        curl_lines = []
+        empty_count = 0
+        while empty_count < 2:
+            line = input()
+            if line.strip():
+                curl_lines.append(line)
+                empty_count = 0
+            else:
+                empty_count += 1
+
+        curl_text = '\n'.join(curl_lines)
+        if not curl_text.strip():
+            raise ValueError("No curl command provided")
+
+        config_data = CurlConfigParser.parse_curl_command(curl_text)
+        if not config_data:
+            raise ValueError("Could not parse curl command")
+
+        print(f"Extracted {len(config_data)} parameters. Saving configuration...")
+        config = CurlConfigParser.generate_config_file(config_data)
+        print(f"Configuration saved to {CONFIG_FILE}")
+        return config
+
+    @staticmethod
+    def validate_config_sections(config: configparser.ConfigParser):
+        """Validate required sections exist"""
+        required_sections = ['OCI', 'Instance', 'Telegram', 'Machine', 'Retry']
+        missing = [s for s in required_sections if not config.has_section(s)]
+        if missing:
+            raise ValueError(f"Missing sections: {missing}")
+
+        required_retry_keys = ['min_interval', 'max_interval', 'initial_retry_interval', 'backoff_factor']
+        missing_keys = [k for k in required_retry_keys if not config.has_option('Retry', k)]
+        if missing_keys:
+            raise ValueError(f"Missing Retry keys: {missing_keys}")
 
     def setup_logging(self):
         """Configure logging with rotation and validation"""
@@ -392,9 +547,32 @@ class OciOccFix:
                 self.adaptive_retry_wait(error_code)
                 time.sleep(self.wait_seconds)
 
-if __name__ == "__main__":
+def main():
+    """Main function with command line argument support"""
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg in ["--setup", "-s"]:
+            try:
+                OciOccFix.setup_config()
+                print("Setup complete! You can now run the bot normally.")
+            except Exception as e:
+                print(f"Setup failed: {e}")
+                sys.exit(1)
+            return
+        elif arg in ["--help", "-h"]:
+            print("OCI Out of Capacity Fix v2.1.4")
+            print("Usage:")
+            print("  python bot.py            # Run the bot (auto-setup if needed)")
+            print("  python bot.py --setup    # Manual configuration setup")
+            print("  python bot.py --help     # Show this help")
+            return
+
+    # Normal execution
     try:
         OciOccFix().run()
     except Exception as e:
-        logging.critical(f"💀 Fatal initialization error: {str(e)}")
+        logging.critical(f"Fatal initialization error: {str(e)}")
         sys.exit(1)
+
+if __name__ == "__main__":
+    main()
